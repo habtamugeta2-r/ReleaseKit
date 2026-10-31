@@ -8,6 +8,7 @@
     "build": "prisma generate && tsc -p tsconfig.json",
     "start": "node dist/server.js",
     "lint": "eslint src test",
+    "pretypecheck": "npm run db:generate",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "pretest": "npm run db:generate",
     "pretest:integration": "npm run db:generate",
