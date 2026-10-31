@@ -1,0 +1,468 @@
+openapi: 3.1.0
+info:
+  title: ReleaseKit API
+  version: 1.0.0
+  description: Release tracking, operational health, and protected private-asset operations.
+servers:
+  - url: http://localhost:4000/api/v1
+    description: Local Express API
+tags:
+  - name: Operations
+  - name: Releases
+  - name: Assets
+paths:
+  /health:
+    get:
+      tags: [Operations]
+      summary: Liveness probe
+      responses:
+        "200":
+          description: The process is responding.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      status:
+                        const: ok
+                    required: [status]
+                required: [data]
+  /ready:
+    get:
+      tags: [Operations]
+      summary: Readiness probe
+      responses:
+        "200":
+          description: PostgreSQL is reachable.
+        "503":
+          description: A required dependency is unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /version:
+    get:
+      tags: [Operations]
+      summary: Deployed application version
+      responses:
+        "200":
+          description: Version identifier.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      version:
+                        type: string
+                    required: [version]
+                required: [data]
+  /releases:
+    get:
+      tags: [Releases]
+      summary: List releases
+      description: Filters are combined with AND. Search matches release name or version without case sensitivity. Results are ordered by the selected field and then by ID in the same direction.
+      parameters:
+        - in: query
+          name: page
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000000
+            default: 1
+        - in: query
+          name: pageSize
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 20
+        - in: query
+          name: status
+          schema:
+            $ref: "#/components/schemas/ReleaseStatus"
+        - in: query
+          name: search
+          description: Case-insensitive substring match against name and version.
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 120
+        - in: query
+          name: createdAfter
+          description: Inclusive lower bound for release creation time.
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: createdBefore
+          description: Inclusive upper bound for release creation time.
+          schema:
+            type: string
+            format: date-time
+        - in: query
+          name: sortBy
+          schema:
+            type: string
+            enum: [createdAt, updatedAt, name, version, status]
+            default: createdAt
+        - in: query
+          name: sortOrder
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+      responses:
+        "200":
+          description: Paginated release list.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Release"
+                  meta:
+                    $ref: "#/components/schemas/Pagination"
+                required: [data, meta]
+        "400":
+          $ref: "#/components/responses/ValidationError"
+    post:
+      tags: [Releases]
+      summary: Create a release
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReleaseInput"
+      responses:
+        "201":
+          description: Created release.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Release"
+                required: [data]
+        "400":
+          $ref: "#/components/responses/ValidationError"
+  /releases/{id}:
+    parameters:
+      - $ref: "#/components/parameters/ReleaseId"
+    get:
+      tags: [Releases]
+      summary: Retrieve a release
+      responses:
+        "200":
+          description: Release record.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Release"
+                required: [data]
+        "404":
+          $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Releases]
+      summary: Update a release
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReleasePatch"
+      responses:
+        "200":
+          description: Updated release.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Release"
+                required: [data]
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Releases]
+      summary: Delete a release and its asset metadata
+      responses:
+        "204":
+          description: Release deleted.
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /releases/{id}/assets:
+    parameters:
+      - $ref: "#/components/parameters/ReleaseId"
+    get:
+      tags: [Assets]
+      summary: List release asset metadata
+      description: Requires the service-to-service asset token. Storage keys and credentials are never returned.
+      security:
+        - AssetToken: []
+      responses:
+        "200":
+          description: Assets ordered by creation time, newest first.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Asset"
+                required: [data]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: Asset storage is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+    post:
+      tags: [Assets]
+      summary: Upload a private release asset
+      description: Requires the service-to-service asset token. Accepted file bytes are checked against the declared MIME type.
+      security:
+        - AssetToken: []
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+              required: [file]
+      responses:
+        "201":
+          description: Stored asset metadata; object keys are never returned.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    $ref: "#/components/schemas/Asset"
+                required: [data]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "413":
+          description: Upload exceeds configured byte limit.
+        "415":
+          description: Unsupported content type or invalid file signature.
+  /releases/{id}/assets/{assetId}/download:
+    parameters:
+      - $ref: "#/components/parameters/ReleaseId"
+      - $ref: "#/components/parameters/AssetId"
+    get:
+      tags: [Assets]
+      summary: Create a short-lived private download URL
+      security:
+        - AssetToken: []
+      responses:
+        "200":
+          description: URL valid for 120 seconds.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: object
+                    properties:
+                      url:
+                        type: string
+                        format: uri
+                      expiresInSeconds:
+                        const: 120
+                    required: [url, expiresInSeconds]
+                required: [data]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    delete:
+      tags: [Assets]
+      summary: Delete a private release asset
+      security:
+        - AssetToken: []
+      responses:
+        "204":
+          description: Object and metadata deleted.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+components:
+  securitySchemes:
+    AssetToken:
+      type: http
+      scheme: bearer
+      description: Long-lived service token; never expose it in browser code.
+  parameters:
+    ReleaseId:
+      in: path
+      name: id
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+    AssetId:
+      in: path
+      name: assetId
+      required: true
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 64
+  schemas:
+    ReleaseStatus:
+      type: string
+      enum: [DRAFT, DEPLOYING, SUCCEEDED, FAILED]
+    Release:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+          maxLength: 120
+        version:
+          type: string
+          maxLength: 64
+        status:
+          $ref: "#/components/schemas/ReleaseStatus"
+        description:
+          type: [string, "null"]
+          maxLength: 2000
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+      required: [id, name, version, status, description, createdAt, updatedAt]
+    ReleaseInput:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        status:
+          $ref: "#/components/schemas/ReleaseStatus"
+        description:
+          type: [string, "null"]
+          maxLength: 2000
+      required: [name, version]
+    ReleasePatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        status:
+          $ref: "#/components/schemas/ReleaseStatus"
+        description:
+          type: [string, "null"]
+          maxLength: 2000
+    Asset:
+      type: object
+      properties:
+        id:
+          type: string
+        fileName:
+          type: string
+        contentType:
+          type: string
+        sizeBytes:
+          type: integer
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+      required: [id, fileName, contentType, sizeBytes, createdAt]
+    Pagination:
+      type: object
+      properties:
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        total:
+          type: integer
+        totalPages:
+          type: integer
+        hasNextPage:
+          type: boolean
+      required: [page, pageSize, total, totalPages, hasNextPage]
+    ErrorResponse:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            requestId:
+              type: string
+              format: uuid
+          required: [code, message, requestId]
+      required: [error]
+  responses:
+    ValidationError:
+      description: Request validation failed.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    NotFound:
+      description: The requested resource does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Unauthorized:
+      description: Asset service token is missing or invalid.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
