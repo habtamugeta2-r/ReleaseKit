@@ -45,4 +45,3 @@ export type ReleaseQuery = {
   sortBy?: "createdAt" | "updatedAt" | "name" | "version" | "status";
   sortOrder?: "asc" | "desc";
 };
-localhost
