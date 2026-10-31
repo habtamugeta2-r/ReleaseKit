@@ -1,0 +1,117 @@
+name: Deploy production release
+
+on:
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full commit SHA of an existing, CI-tested and staging-published artifact.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: vars.AWS_DEPLOY_ENABLED == 'true' && github.ref == 'refs/heads/main'
+    name: Approve and deploy the existing release artifact
+    runs-on: ubuntu-latest
+    environment: production
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      RELEASE_SHA: ${{ inputs.commit_sha }}
+      ECR_API_REPOSITORY: ${{ vars.ECR_API_REPOSITORY }}
+      ECR_MIGRATOR_REPOSITORY: ${{ vars.ECR_MIGRATOR_REPOSITORY }}
+      ECR_WEB_REPOSITORY: ${{ vars.ECR_WEB_REPOSITORY }}
+    steps:
+      - name: Check out the exact release commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ inputs.commit_sha }}
+          fetch-depth: 0
+
+      - name: Validate the trusted staged release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch origin main --quiet
+          if ! git merge-base --is-ancestor "$RELEASE_SHA" origin/main; then
+            printf 'The requested release is not reachable from main.\n' >&2
+            exit 1
+          fi
+          successful_ci="$(gh run list --workflow ci.yml --commit "$RELEASE_SHA" \
+            --json event,headBranch,status,conclusion \
+            --jq 'any(.[]; .event == "push" and .headBranch == "main" and .status == "completed" and .conclusion == "success")')"
+          if [[ "$successful_ci" != "true" ]]; then
+            printf 'The requested commit has no successful main-branch CI run.\n' >&2
+            exit 1
+          fi
+          staged_success="$(gh run list --workflow deploy-staging.yml --commit "$RELEASE_SHA" \
+            --json event,headBranch,status,conclusion \
+            --jq 'any(.[]; .event == "workflow_run" and .headBranch == "main" and .status == "completed" and .conclusion == "success")')"
+          if [[ "$staged_success" != "true" ]]; then
+            printf 'The selected commit has no successful staging deployment.\n' >&2
+            exit 1
+          fi
+
+      - name: Assume production AWS role with OIDC
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: releasekit-production-${{ github.run_id }}
+
+      - name: Validate immutable artifacts exist in ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          for repository in "$ECR_API_REPOSITORY" "$ECR_MIGRATOR_REPOSITORY" "$ECR_WEB_REPOSITORY"; do
+            aws ecr describe-images \
+              --repository-name "${repository##*/}" \
+              --image-ids "imageTag=${RELEASE_SHA}" \
+              --region "$AWS_REGION" >/dev/null
+          done
+
+      - name: Verify the approved immutable artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          for repository in "$ECR_API_REPOSITORY" "$ECR_MIGRATOR_REPOSITORY" "$ECR_WEB_REPOSITORY"; do
+            aws ecr describe-images \
+              --repository-name "${repository##*/}" \
+              --image-ids "imageTag=${RELEASE_SHA}" \
+              --region "$AWS_REGION" \
+              --query 'imageDetails[0].imageDigest' \
+              --output text
+          done
+
+      - name: Deploy and verify
+        shell: bash
+        env:
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_API_SERVICE: ${{ vars.ECS_API_SERVICE }}
+          ECS_WEB_SERVICE: ${{ vars.ECS_WEB_SERVICE }}
+          ECS_API_TASK_FAMILY: ${{ vars.ECS_API_TASK_FAMILY }}
+          ECS_WEB_TASK_FAMILY: ${{ vars.ECS_WEB_TASK_FAMILY }}
+          ECS_MIGRATOR_TASK_FAMILY: ${{ vars.ECS_MIGRATOR_TASK_FAMILY }}
+          ECS_PRIVATE_SUBNETS: ${{ vars.ECS_PRIVATE_SUBNETS }}
+          ECS_TASK_SECURITY_GROUP: ${{ vars.ECS_TASK_SECURITY_GROUP }}
+          ECS_DESIRED_COUNT: ${{ vars.ECS_DESIRED_COUNT }}
+          API_HEALTH_URL: ${{ vars.API_HEALTH_URL }}
+          WEB_HEALTH_URL: ${{ vars.WEB_HEALTH_URL }}
+          ECR_API_IMAGE: ${{ env.ECR_API_REPOSITORY }}:${{ env.RELEASE_SHA }}
+          ECR_MIGRATOR_IMAGE: ${{ env.ECR_MIGRATOR_REPOSITORY }}:${{ env.RELEASE_SHA }}
+          ECR_WEB_IMAGE: ${{ env.ECR_WEB_REPOSITORY }}:${{ env.RELEASE_SHA }}
+        run: bash scripts/deploy-ecs.sh

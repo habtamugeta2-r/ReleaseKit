@@ -1,0 +1,41 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+enum ReleaseStatus {
+  DRAFT
+  DEPLOYING
+  SUCCEEDED
+  FAILED
+}
+
+model Release {
+  id          String        @id @default(cuid())
+  name        String        @db.VarChar(120)
+  version     String        @db.VarChar(64)
+  status      ReleaseStatus @default(DRAFT)
+  description String?       @db.VarChar(2000)
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+  assets      ReleaseAsset[]
+
+  @@index([createdAt])
+  @@index([status, createdAt])
+}
+
+model ReleaseAsset {
+  id          String   @id @default(cuid())
+  releaseId   String
+  objectKey   String   @unique
+  fileName    String   @db.VarChar(255)
+  contentType String   @db.VarChar(120)
+  sizeBytes   Int
+  createdAt   DateTime @default(now())
+  release     Release  @relation(fields: [releaseId], references: [id], onDelete: Restrict)
+
+  @@index([releaseId, createdAt])
+}

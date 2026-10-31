@@ -1,0 +1,178 @@
+name: Deploy staging
+
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      commit_sha:
+        description: Full commit SHA whose passing CI result and artifacts should be deployed.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-staging
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      vars.AWS_DEPLOY_ENABLED == 'true' &&
+      (
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+        (
+          github.event_name == 'workflow_run' &&
+          github.event.workflow_run.conclusion == 'success' &&
+          github.event.workflow_run.event == 'push' &&
+          github.event.workflow_run.head_branch == 'main' &&
+          github.event.workflow_run.head_repository.full_name == github.repository
+        )
+      )
+    name: Build and deploy verified staging artifact
+    runs-on: ubuntu-latest
+    environment: staging
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      RELEASE_SHA: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.commit_sha }}
+      ECR_API_REPOSITORY: ${{ vars.ECR_API_REPOSITORY }}
+      ECR_MIGRATOR_REPOSITORY: ${{ vars.ECR_MIGRATOR_REPOSITORY }}
+      ECR_WEB_REPOSITORY: ${{ vars.ECR_WEB_REPOSITORY }}
+    steps:
+      - name: Check out the exact CI-tested commit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || inputs.commit_sha }}
+          fetch-depth: 0
+
+      - name: Validate deployment configuration
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [[ -z "$AWS_REGION" || -z "$RELEASE_SHA" || -z "$ECR_API_REPOSITORY" ||
+            -z "$ECR_MIGRATOR_REPOSITORY" || -z "$ECR_WEB_REPOSITORY" ]]; then
+            printf 'One or more required GitHub environment variables are missing.\n' >&2
+            exit 2
+          fi
+          [[ "$RELEASE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          git fetch origin main --quiet
+          if ! git merge-base --is-ancestor "$RELEASE_SHA" origin/main; then
+            printf 'The requested commit is not reachable from main.\n' >&2
+            exit 1
+          fi
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            successful_ci="$(gh run list --workflow ci.yml --commit "$RELEASE_SHA" \
+              --json event,headBranch,status,conclusion \
+              --jq 'any(.[]; .event == "push" and .headBranch == "main" and .status == "completed" and .conclusion == "success")')"
+            if [[ "$successful_ci" != "true" ]]; then
+              printf 'The requested commit has no successful CI run.\n' >&2
+              exit 1
+            fi
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
+
+      - name: Assume staging AWS role with OIDC
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: releasekit-staging-${{ github.run_id }}
+
+      - name: Log in to ECR
+        shell: bash
+        run: |
+          set -euo pipefail
+          registry="${ECR_API_REPOSITORY%%/*}"
+          aws ecr get-login-password --region "$AWS_REGION" |
+            docker login --username AWS --password-stdin "$registry"
+
+      - name: Build and publish immutable images if not already present
+        shell: bash
+        run: |
+          set -euo pipefail
+          repositories=("$ECR_API_REPOSITORY" "$ECR_MIGRATOR_REPOSITORY" "$ECR_WEB_REPOSITORY")
+          existing=0
+          for repository in "${repositories[@]}"; do
+            if aws ecr describe-images \
+              --repository-name "${repository##*/}" \
+              --image-ids "imageTag=${RELEASE_SHA}" \
+              --region "$AWS_REGION" >/dev/null 2>&1; then
+              existing=$((existing + 1))
+            fi
+          done
+          if [[ "$existing" == "3" ]]; then
+            printf 'All immutable images already exist; reusing the commit artifacts.\n'
+          elif [[ "$existing" != "0" ]]; then
+            printf 'Only part of this immutable image set exists; refusing a partial rebuild.\n' >&2
+            exit 1
+          else
+            docker buildx build --file apps/api/Dockerfile --target runtime \
+              --tag "${ECR_API_REPOSITORY}:${RELEASE_SHA}" --push .
+            docker buildx build --file apps/api/Dockerfile --target migrator \
+              --tag "${ECR_MIGRATOR_REPOSITORY}:${RELEASE_SHA}" --push .
+            docker buildx build --file apps/web/Dockerfile \
+              --tag "${ECR_WEB_REPOSITORY}:${RELEASE_SHA}" --push .
+          fi
+
+      - name: Record artifact manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          api_digest="$(aws ecr describe-images --repository-name "${ECR_API_REPOSITORY##*/}" \
+            --image-ids "imageTag=${RELEASE_SHA}" --query imageDetails[0].imageDigest --output text)"
+          migrator_digest="$(aws ecr describe-images --repository-name "${ECR_MIGRATOR_REPOSITORY##*/}" \
+            --image-ids "imageTag=${RELEASE_SHA}" --query imageDetails[0].imageDigest --output text)"
+          web_digest="$(aws ecr describe-images --repository-name "${ECR_WEB_REPOSITORY##*/}" \
+            --image-ids "imageTag=${RELEASE_SHA}" --query imageDetails[0].imageDigest --output text)"
+          jq -n \
+            --arg commit "$RELEASE_SHA" \
+            --arg environment staging \
+            --arg api_image "${ECR_API_REPOSITORY}:${RELEASE_SHA}" \
+            --arg api_digest "$api_digest" \
+            --arg migrator_image "${ECR_MIGRATOR_REPOSITORY}:${RELEASE_SHA}" \
+            --arg migrator_digest "$migrator_digest" \
+            --arg web_image "${ECR_WEB_REPOSITORY}:${RELEASE_SHA}" \
+            --arg web_digest "$web_digest" \
+            --arg run_url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            '{commit: $commit, environment: $environment, images: {api: {tag: $api_image, digest: $api_digest}, migrator: {tag: $migrator_image, digest: $migrator_digest}, web: {tag: $web_image, digest: $web_digest}}, workflowRun: $run_url}' \
+            > release-manifest.json
+
+      - name: Preserve release manifest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-manifest-${{ env.RELEASE_SHA }}
+          path: release-manifest.json
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Deploy and verify
+        shell: bash
+        env:
+          ECS_CLUSTER: ${{ vars.ECS_CLUSTER }}
+          ECS_API_SERVICE: ${{ vars.ECS_API_SERVICE }}
+          ECS_WEB_SERVICE: ${{ vars.ECS_WEB_SERVICE }}
+          ECS_API_TASK_FAMILY: ${{ vars.ECS_API_TASK_FAMILY }}
+          ECS_WEB_TASK_FAMILY: ${{ vars.ECS_WEB_TASK_FAMILY }}
+          ECS_MIGRATOR_TASK_FAMILY: ${{ vars.ECS_MIGRATOR_TASK_FAMILY }}
+          ECS_PRIVATE_SUBNETS: ${{ vars.ECS_PRIVATE_SUBNETS }}
+          ECS_TASK_SECURITY_GROUP: ${{ vars.ECS_TASK_SECURITY_GROUP }}
+          ECS_DESIRED_COUNT: ${{ vars.ECS_DESIRED_COUNT }}
+          API_HEALTH_URL: ${{ vars.API_HEALTH_URL }}
+          WEB_HEALTH_URL: ${{ vars.WEB_HEALTH_URL }}
+          ECR_API_IMAGE: ${{ env.ECR_API_REPOSITORY }}:${{ env.RELEASE_SHA }}
+          ECR_MIGRATOR_IMAGE: ${{ env.ECR_MIGRATOR_REPOSITORY }}:${{ env.RELEASE_SHA }}
+          ECR_WEB_IMAGE: ${{ env.ECR_WEB_REPOSITORY }}:${{ env.RELEASE_SHA }}
+        run: bash scripts/deploy-ecs.sh

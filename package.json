@@ -1,0 +1,40 @@
+{
+  "name": "releasekit",
+  "private": true,
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "engines": {
+    "node": ">=22",
+    "npm": ">=10"
+  },
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c blue,green \"npm:dev --workspace=@releasekit/api\" \"npm:dev --workspace=@releasekit/web\"",
+    "build": "npm run build --workspaces --if-present",
+    "lint": "npm run lint --workspaces --if-present",
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "test": "npm run test --workspaces --if-present",
+    "test:coverage": "npm run test:coverage --workspace=@releasekit/web",
+    "test:integration": "npm run test:integration --workspace=@releasekit/api",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "db:generate": "npm run db:generate --workspace=@releasekit/api",
+    "db:migrate:dev": "npm run db:migrate:dev --workspace=@releasekit/api",
+    "db:migrate:deploy": "npm run db:migrate:deploy --workspace=@releasekit/api",
+    "db:reset": "npm run db:reset --workspace=@releasekit/api"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.35.0",
+    "concurrently": "^9.2.1",
+    "eslint": "^9.35.0",
+    "prettier": "^3.6.2",
+    "typescript-eslint": "^8.43.0"
+  },
+  "allowScripts": {
+    "@prisma/client@7.10.1": true,
+    "esbuild@0.28.2": true,
+    "prisma@7.10.1": true,
+    "@prisma/engines@7.10.1": true
+  }
+}
