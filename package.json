@@ -25,7 +25,7 @@
     "db:reset": "npm run db:reset --workspace=@releasekit/api"
   },
   "devDependencies": {
-    "@eslint/js": "^9.35.0",
+    "@eslint/js": "^10.0.1",
     "concurrently": "^9.2.1",
     "eslint": "^9.35.0",
     "prettier": "^3.6.2",
